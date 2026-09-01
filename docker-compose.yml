@@ -1,0 +1,25 @@
+services:
+  rustdesk-api:
+    image: ghcr.io/invokerw/rustdesk-minimal-api:latest
+    container_name: rustdesk-minimal-api
+    restart: unless-stopped
+    env_file:
+      - ./rustdesk-api.env
+    environment:
+      RUSTDESK_API_LISTEN: 0.0.0.0:21114
+      RUSTDESK_API_DATA: /data/state.json
+      RUSTDESK_API_ENABLE_INVENTORY: "false"
+    ports:
+      - "127.0.0.1:21114:21114"
+    volumes:
+      - rustdesk-api-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  rustdesk-api-data:
