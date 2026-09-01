@@ -164,6 +164,7 @@ func TestLogoutRevokesToken(t *testing.T) {
 	server := newTestServer(t)
 	handler := server.routes()
 	token := loginForToken(t, handler)
+	secondToken := loginForToken(t, handler)
 
 	resp := doRequest(t, handler, http.MethodPost, "/api/logout", map[string]any{}, token)
 	if resp.Code != http.StatusOK {
@@ -173,6 +174,64 @@ func TestLogoutRevokesToken(t *testing.T) {
 	resp = doRequest(t, handler, http.MethodPost, "/api/currentUser", map[string]any{}, token)
 	if resp.Code != http.StatusUnauthorized {
 		t.Fatalf("currentUser after logout status = %d, want %d", resp.Code, http.StatusUnauthorized)
+	}
+	resp = doRequest(t, handler, http.MethodPost, "/api/currentUser", nil, secondToken)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("second token after logout status = %d, want %d", resp.Code, http.StatusOK)
+	}
+}
+
+func TestInventoryDisabledByDefault(t *testing.T) {
+	t.Parallel()
+
+	server := newTestServer(t)
+	server.cfg.EnableInventory = false
+	resp := doRequest(t, server.routes(), http.MethodPost, "/api/heartbeat", map[string]any{"id": "device"}, "")
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("disabled heartbeat status = %d, want %d", resp.Code, http.StatusNotFound)
+	}
+}
+
+func TestAddressBookRevisionConflict(t *testing.T) {
+	t.Parallel()
+
+	server := newTestServer(t)
+	handler := server.routes()
+	token := loginForToken(t, handler)
+	resp := doRequest(t, handler, http.MethodGet, "/api/ab", nil, token)
+	var current addressBookResponse
+	decodeResponse(t, resp, &current)
+
+	resp = doRequest(t, handler, http.MethodPost, "/api/ab", addressBookUpdateRequest{
+		Data:     `{"tags":[],"peers":[]}`,
+		Revision: &current.Revision,
+	}, token)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("first revision update status = %d, want %d", resp.Code, http.StatusOK)
+	}
+	stale := current.Revision
+	resp = doRequest(t, handler, http.MethodPost, "/api/ab", addressBookUpdateRequest{
+		Data:     `{"tags":["stale"],"peers":[]}`,
+		Revision: &stale,
+	}, token)
+	if resp.Code != http.StatusConflict {
+		t.Fatalf("stale revision update status = %d, want %d", resp.Code, http.StatusConflict)
+	}
+}
+
+func TestLoginRateLimit(t *testing.T) {
+	t.Parallel()
+
+	server := newTestServer(t)
+	server.loginMu.Lock()
+	server.loginFailures["192.0.2.1"] = loginFailure{WindowStart: time.Now(), Count: loginMaxFails}
+	server.loginMu.Unlock()
+	req := httptest.NewRequest(http.MethodPost, "/api/login", bytes.NewBufferString(`{"username":"alice","password":"wrong"}`))
+	req.RemoteAddr = "192.0.2.1:1234"
+	resp := httptest.NewRecorder()
+	server.routes().ServeHTTP(resp, req)
+	if resp.Code != http.StatusTooManyRequests {
+		t.Fatalf("rate limited login status = %d, want %d", resp.Code, http.StatusTooManyRequests)
 	}
 }
 
@@ -205,12 +264,13 @@ func TestParseCredential(t *testing.T) {
 func newTestServer(t *testing.T) *apiServer {
 	t.Helper()
 	cfg := config{
-		Listen:       ":0",
-		Username:     "alice",
-		PasswordHash: mustBcryptHash(t, "secret"),
-		DisplayName:  "Alice",
-		DataFile:     filepath.Join(t.TempDir(), "state.json"),
-		TokenTTL:     time.Hour,
+		Listen:          ":0",
+		Username:        "alice",
+		PasswordHash:    mustBcryptHash(t, "secret"),
+		DisplayName:     "Alice",
+		DataFile:        filepath.Join(t.TempDir(), "state.json"),
+		TokenTTL:        time.Hour,
+		EnableInventory: true,
 	}
 	server, err := newAPIServer(cfg)
 	if err != nil {

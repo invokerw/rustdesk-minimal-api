@@ -9,7 +9,7 @@ It intentionally covers only the basics:
 - current user lookup
 - legacy address book sync
 - a basic device inventory that populates the **Accessible devices** tab
-- heartbeat/sysinfo ingestion for device discovery
+- optional heartbeat/sysinfo ingestion for device discovery (disabled by default)
 
 It is **not** a replacement for RustDesk Server Pro.
 It is meant for a small self-hosted setup where you want private login, contacts, and a simple device list.
@@ -36,6 +36,7 @@ The server persists a small JSON state file containing:
 - a signing secret for access tokens
 - a token version counter used to revoke tokens on logout
 - the legacy address book JSON blob
+- an address book revision counter for conditional updates
 - the last address book update timestamp
 - device inventory learned from `/api/heartbeat` and `/api/sysinfo`
 
@@ -109,6 +110,8 @@ Environment variables are also supported:
 - `RUSTDESK_API_DISPLAY_NAME`
 - `RUSTDESK_API_DATA`
 - `RUSTDESK_API_TOKEN_TTL`
+- `RUSTDESK_API_ENABLE_INVENTORY` (default `false`)
+- `RUSTDESK_API_CORS_ORIGIN` (empty by default; wildcard CORS is not enabled)
 
 Example:
 
@@ -117,6 +120,18 @@ export RUSTDESK_API_CREDENTIAL='alice:$2y$10$...................................
 export RUSTDESK_API_DATA=./state.json
 go run .
 ```
+
+For a public deployment, keep the service private and put TLS in front of it:
+
+```bash
+export RUSTDESK_API_LISTEN=127.0.0.1:21114
+export RUSTDESK_API_ENABLE_INVENTORY=false
+go run .
+```
+
+Use Caddy or Nginx to proxy `https://YOUR_HOST` to `127.0.0.1:21114`. Do not expose
+the plain HTTP listener to the Internet: login passwords and Bearer tokens would
+otherwise be sent without transport encryption.
 
 ## RustDesk client configuration
 
@@ -127,7 +142,9 @@ If a client has a custom ID server set and leaves the API server empty, RustDesk
 http://YOUR_HOST:21114
 ```
 
-So if you want old/existing clients to work automatically, expose plain HTTP on port `21114`.
+If you need the old client's automatic port inference, expose port `21114` only
+inside a trusted LAN or through a TLS-capable reverse proxy. Explicitly configured
+clients should use `https://YOUR_HOST`.
 
 ### Secure mode
 For clients you configure explicitly, prefer:
@@ -136,23 +153,23 @@ For clients you configure explicitly, prefer:
 https://YOUR_HOST
 ```
 
-That gives you TLS via Caddy while keeping `21114` available for compatibility.
+That gives you TLS via Caddy while keeping the Go service bound to loopback.
 
 ## Accessible devices tab
 
-The server populates `/api/users`, `/api/peers`, and `/api/device-group/accessible` from device heartbeats/sysinfo.
+The server can populate `/api/users`, `/api/peers`, and `/api/device-group/accessible`
+from device heartbeats/sysinfo when inventory is explicitly enabled.
 
 In practice this means:
-- once a RustDesk client points to this API server, it will start posting heartbeat/sysinfo data
+- once a RustDesk client points to this API server, it may post heartbeat/sysinfo data
 - after you log in, the **Accessible devices** tab can list those devices
 - devices remain listed even when offline; the client resolves online/offline status separately
 - all discovered devices belong to the single configured user
+- inventory is disabled by default because these client uploads are unauthenticated
 
 ## Deployment with systemd + Caddy
 
-This layout gives you both:
-- compatibility for existing clients on `http://YOUR_HOST:21114`
-- HTTPS for explicitly configured clients on `https://YOUR_HOST`
+This layout keeps the API listener private and exposes the service through HTTPS.
 
 ### 1. Build and install the binary
 
@@ -191,7 +208,7 @@ User=rustdeskapi
 Group=rustdeskapi
 EnvironmentFile=/etc/default/rustdesk-minimal-api
 WorkingDirectory=/var/lib/rustdesk-minimal-api
-ExecStart=/usr/local/bin/rustdesk-minimal-api -listen 0.0.0.0:21114
+ExecStart=/usr/local/bin/rustdesk-minimal-api -listen 127.0.0.1:21114
 Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=yes
@@ -226,20 +243,23 @@ sudo systemctl restart caddy
 ```bash
 sudo ufw allow 80/tcp
 sudo ufw allow 443/tcp
-sudo ufw allow 21114/tcp
 ```
 
 ### Resulting traffic flow
 
-- `http://YOUR_HOST:21114` → direct plain HTTP to `rustdesk-minimal-api`
 - `https://YOUR_HOST` → Caddy TLS termination → reverse proxy to `127.0.0.1:21114`
 
 ## Notes
 
 - Only the legacy address book flow is implemented. The newer shared address book APIs intentionally return `404`.
-- Logout revokes all previously issued tokens by bumping a token version counter.
-- The inventory is learned from unauthenticated `/api/heartbeat` and `/api/sysinfo` requests.
-- If you expose port `21114` publicly for compatibility, that endpoint is plain HTTP by design.
+- `GET /api/ab` returns a `revision` field. Automation can include that revision in
+  `POST /api/ab` to receive `409 Conflict` instead of overwriting a newer update.
+  Official clients omit it and retain their normal legacy behavior.
+- Logout revokes only the token used for that logout; other active devices remain logged in.
+- Login attempts are rate-limited per source address. HTTP read/write/header timeouts
+  and request body limits are enabled by default.
+- Inventory uploads, when enabled, are unauthenticated for compatibility with
+  official clients; enable them only on a trusted/private network.
 
 ## Test
 

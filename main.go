@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -12,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -29,21 +31,43 @@ const defaultAddressBookJSON = `{"tags":[],"peers":[]}`
 const (
 	maxBodySize     = 8 << 20
 	defaultPageSize = 100
+	maxPageSize     = 1000
+	maxDeviceCount  = 10000
+	maxDeviceIDSize = 128
+	loginWindow     = time.Minute
+	loginMaxFails   = 10
 )
 
+var errAddressBookConflict = errors.New("address book revision conflict")
+
+type tokenContextKey struct{}
+
+func contextWithToken(ctx context.Context, token string) context.Context {
+	return context.WithValue(ctx, tokenContextKey{}, token)
+}
+
+func tokenFromContext(ctx context.Context) (string, bool) {
+	token, ok := ctx.Value(tokenContextKey{}).(string)
+	return token, ok && token != ""
+}
+
 type config struct {
-	Listen       string
-	Username     string
-	PasswordHash string
-	DisplayName  string
-	DataFile     string
-	TokenTTL     time.Duration
+	Listen          string
+	Username        string
+	PasswordHash    string
+	DisplayName     string
+	DataFile        string
+	TokenTTL        time.Duration
+	EnableInventory bool
+	CORSOrigin      string
 }
 
 type persistentState struct {
 	TokenSecret          string                  `json:"token_secret"`
 	TokenVersion         int64                   `json:"token_version"`
+	RevokedTokens        map[string]time.Time    `json:"revoked_tokens,omitempty"`
 	AddressBook          string                  `json:"address_book"`
+	AddressBookRevision  uint64                  `json:"address_book_revision"`
 	AddressBookUpdatedAt time.Time               `json:"address_book_updated_at"`
 	Devices              map[string]deviceRecord `json:"devices"`
 }
@@ -71,12 +95,20 @@ type tokenClaims struct {
 	Subject string `json:"sub"`
 	Expiry  int64  `json:"exp"`
 	Version int64  `json:"ver"`
+	ID      string `json:"jti"`
 }
 
 type apiServer struct {
-	cfg   config
-	mu    sync.Mutex
-	state persistentState
+	cfg           config
+	mu            sync.Mutex
+	state         persistentState
+	loginMu       sync.Mutex
+	loginFailures map[string]loginFailure
+}
+
+type loginFailure struct {
+	WindowStart time.Time
+	Count       int
 }
 
 type loginRequest struct {
@@ -104,6 +136,7 @@ type userPayload struct {
 
 type addressBookResponse struct {
 	Data            string    `json:"data"`
+	Revision        uint64    `json:"revision"`
 	UpdatedAt       time.Time `json:"updated_at"`
 	LicensedDevices int       `json:"licensed_devices"`
 }
@@ -114,7 +147,8 @@ type pageResponse[T any] struct {
 }
 
 type addressBookUpdateRequest struct {
-	Data string `json:"data"`
+	Data     string  `json:"data"`
+	Revision *uint64 `json:"revision,omitempty"`
 }
 
 type deviceGroupPayload struct {
@@ -142,7 +176,10 @@ func main() {
 		Addr:              cfg.Listen,
 		Handler:           server.routes(),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
 		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    16 << 10,
 	}
 
 	log.Printf("minimal RustDesk API server listening on %s", cfg.Listen)
@@ -160,6 +197,8 @@ func loadConfig() config {
 	displayName := flag.String("display-name", getenv("RUSTDESK_API_DISPLAY_NAME", ""), "display name returned to the client")
 	dataFile := flag.String("data", getenv("RUSTDESK_API_DATA", "./state.json"), "path to the persistent state file")
 	tokenTTL := flag.Duration("token-ttl", getenvDuration("RUSTDESK_API_TOKEN_TTL", 30*24*time.Hour), "issued token lifetime")
+	enableInventory := flag.Bool("enable-inventory", getenvBool("RUSTDESK_API_ENABLE_INVENTORY", false), "accept unauthenticated RustDesk heartbeat/sysinfo uploads")
+	corsOrigin := flag.String("cors-origin", getenv("RUSTDESK_API_CORS_ORIGIN", ""), "CORS origin; empty disables cross-origin access")
 	flag.Parse()
 
 	username, passwordHash, err := parseCredential(*credential)
@@ -168,12 +207,14 @@ func loadConfig() config {
 	}
 
 	cfg := config{
-		Listen:       *listen,
-		Username:     username,
-		PasswordHash: passwordHash,
-		DisplayName:  strings.TrimSpace(*displayName),
-		DataFile:     *dataFile,
-		TokenTTL:     *tokenTTL,
+		Listen:          *listen,
+		Username:        username,
+		PasswordHash:    passwordHash,
+		DisplayName:     strings.TrimSpace(*displayName),
+		DataFile:        *dataFile,
+		TokenTTL:        *tokenTTL,
+		EnableInventory: *enableInventory,
+		CORSOrigin:      strings.TrimSpace(*corsOrigin),
 	}
 	if cfg.DisplayName == "" {
 		cfg.DisplayName = cfg.Username
@@ -202,7 +243,7 @@ func parseCredential(spec string) (string, string, error) {
 }
 
 func newAPIServer(cfg config) (*apiServer, error) {
-	s := &apiServer{cfg: cfg}
+	s := &apiServer{cfg: cfg, loginFailures: make(map[string]loginFailure)}
 	if err := s.loadState(); err != nil {
 		return nil, err
 	}
@@ -228,9 +269,12 @@ func (s *apiServer) routes() http.Handler {
 
 func (s *apiServer) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		if s.cfg.CORSOrigin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", s.cfg.CORSOrigin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -250,7 +294,7 @@ func (s *apiServer) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			writeError(w, http.StatusUnauthorized, "Invalid token")
 			return
 		}
-		next(w, r)
+		next(w, r.WithContext(contextWithToken(r.Context(), token)))
 	}
 }
 
@@ -283,10 +327,18 @@ func (s *apiServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "unsupported login type")
 		return
 	}
+	remote := clientAddress(r)
+	if !s.allowLogin(remote) {
+		w.Header().Set("Retry-After", "60")
+		writeError(w, http.StatusTooManyRequests, "too many login attempts")
+		return
+	}
 	if !s.validCredentials(strings.TrimSpace(req.Username), req.Password) {
+		s.recordLoginFailure(remote)
 		writeError(w, http.StatusUnauthorized, "Invalid username or password")
 		return
 	}
+	s.clearLoginFailures(remote)
 
 	token, err := s.issueToken()
 	if err != nil {
@@ -312,7 +364,12 @@ func (s *apiServer) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if !allowMethods(w, r, http.MethodPost) {
 		return
 	}
-	if err := s.bumpTokenVersion(); err != nil {
+	token, ok := tokenFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "Invalid token")
+		return
+	}
+	if err := s.revokeToken(token); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to logout")
 		return
 	}
@@ -333,7 +390,11 @@ func (s *apiServer) handleAddressBook(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "address book data must be valid JSON")
 			return
 		}
-		if err := s.updateAddressBook(req.Data); err != nil {
+		if err := s.updateAddressBook(req.Data, req.Revision); err != nil {
+			if errors.Is(err, errAddressBookConflict) {
+				writeError(w, http.StatusConflict, err.Error())
+				return
+			}
 			writeError(w, http.StatusInternalServerError, "failed to persist address book")
 			return
 		}
@@ -354,6 +415,7 @@ func (s *apiServer) respondAddressBook(w http.ResponseWriter) {
 	s.mu.Lock()
 	resp := addressBookResponse{
 		Data:            s.state.AddressBook,
+		Revision:        s.state.AddressBookRevision,
 		UpdatedAt:       s.state.AddressBookUpdatedAt.UTC(),
 		LicensedDevices: 0,
 	}
@@ -431,6 +493,10 @@ func (s *apiServer) handleAccessibleDeviceGroups(w http.ResponseWriter, r *http.
 }
 
 func (s *apiServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.EnableInventory {
+		http.NotFound(w, r)
+		return
+	}
 	if !allowMethods(w, r, http.MethodPost) {
 		return
 	}
@@ -447,6 +513,10 @@ func (s *apiServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *apiServer) handleSysinfo(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.EnableInventory {
+		http.NotFound(w, r)
+		return
+	}
 	if !allowMethods(w, r, http.MethodPost) {
 		return
 	}
@@ -481,6 +551,44 @@ func (s *apiServer) validCredentials(username, password string) bool {
 		return false
 	}
 	return bcrypt.CompareHashAndPassword([]byte(s.cfg.PasswordHash), []byte(password)) == nil
+}
+
+func clientAddress(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+func (s *apiServer) allowLogin(key string) bool {
+	now := time.Now()
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	failure := s.loginFailures[key]
+	if failure.WindowStart.IsZero() || now.Sub(failure.WindowStart) >= loginWindow {
+		delete(s.loginFailures, key)
+		return true
+	}
+	return failure.Count < loginMaxFails
+}
+
+func (s *apiServer) recordLoginFailure(key string) {
+	now := time.Now()
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	failure := s.loginFailures[key]
+	if failure.WindowStart.IsZero() || now.Sub(failure.WindowStart) >= loginWindow {
+		failure = loginFailure{WindowStart: now}
+	}
+	failure.Count++
+	s.loginFailures[key] = failure
+}
+
+func (s *apiServer) clearLoginFailures(key string) {
+	s.loginMu.Lock()
+	delete(s.loginFailures, key)
+	s.loginMu.Unlock()
 }
 
 func (s *apiServer) loadState() error {
@@ -519,6 +627,9 @@ func (s *apiServer) ensureStateDefaultsLocked() error {
 		}
 		s.state.TokenSecret = secret
 	}
+	if s.state.RevokedTokens == nil {
+		s.state.RevokedTokens = make(map[string]time.Time)
+	}
 	if s.state.AddressBook == "" {
 		s.state.AddressBook = defaultAddressBookJSON
 	}
@@ -528,6 +639,9 @@ func (s *apiServer) ensureStateDefaultsLocked() error {
 	if s.state.AddressBookUpdatedAt.IsZero() {
 		s.state.AddressBookUpdatedAt = time.Now().UTC()
 	}
+	if s.state.AddressBookRevision == 0 {
+		s.state.AddressBookRevision = 1
+	}
 	if s.state.Devices == nil {
 		s.state.Devices = make(map[string]deviceRecord)
 	}
@@ -535,7 +649,7 @@ func (s *apiServer) ensureStateDefaultsLocked() error {
 }
 
 func (s *apiServer) saveStateLocked() error {
-	if err := os.MkdirAll(filepath.Dir(s.cfg.DataFile), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(s.cfg.DataFile), 0o750); err != nil {
 		return fmt.Errorf("create state directory: %w", err)
 	}
 	payload, err := json.MarshalIndent(s.state, "", "  ")
@@ -552,18 +666,40 @@ func (s *apiServer) saveStateLocked() error {
 	return nil
 }
 
-func (s *apiServer) updateAddressBook(data string) error {
+func (s *apiServer) updateAddressBook(data string, expected *uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if expected != nil && *expected != s.state.AddressBookRevision {
+		return errAddressBookConflict
+	}
 	s.state.AddressBook = data
+	s.state.AddressBookRevision++
 	s.state.AddressBookUpdatedAt = time.Now().UTC()
 	return s.saveStateLocked()
 }
 
-func (s *apiServer) bumpTokenVersion() error {
+func (s *apiServer) revokeToken(token string) error {
+	parts := strings.Split(token, ".")
+	if len(parts) != 2 {
+		return errors.New("invalid token format")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return errors.New("invalid token payload")
+	}
+	var claims tokenClaims
+	if err := json.Unmarshal(payload, &claims); err != nil || claims.ID == "" {
+		return errors.New("invalid token claims")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.state.TokenVersion++
+	now := time.Now()
+	for id, expiry := range s.state.RevokedTokens {
+		if !now.Before(expiry) {
+			delete(s.state.RevokedTokens, id)
+		}
+	}
+	s.state.RevokedTokens[claims.ID] = time.Unix(claims.Expiry, 0)
 	return s.saveStateLocked()
 }
 
@@ -573,6 +709,12 @@ func (s *apiServer) issueToken() (string, error) {
 		Subject: s.cfg.Username,
 		Expiry:  time.Now().Add(s.cfg.TokenTTL).Unix(),
 		Version: s.state.TokenVersion,
+	}
+	var err error
+	claims.ID, err = randomToken(24)
+	if err != nil {
+		s.mu.Unlock()
+		return "", err
 	}
 	secret := s.state.TokenSecret
 	s.mu.Unlock()
@@ -622,6 +764,12 @@ func (s *apiServer) verifyToken(token string) error {
 	if time.Now().Unix() >= claims.Expiry {
 		return errors.New("token expired")
 	}
+	s.mu.Lock()
+	revokedAt, revoked := s.state.RevokedTokens[claims.ID]
+	s.mu.Unlock()
+	if revoked && time.Now().Before(revokedAt) {
+		return errors.New("token revoked")
+	}
 	return nil
 }
 
@@ -630,9 +778,15 @@ func (s *apiServer) recordHeartbeat(payload map[string]any) error {
 	if id == "" {
 		return errors.New("missing device id")
 	}
+	if len(id) > maxDeviceIDSize {
+		return errors.New("device id is too long")
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, exists := s.state.Devices[id]; !exists && len(s.state.Devices) >= maxDeviceCount {
+		return errors.New("device inventory is full")
+	}
 
 	device := s.getOrCreateDeviceLocked(id)
 	device.UUID = firstNonEmpty(strings.TrimSpace(stringValue(payload["uuid"])), device.UUID)
@@ -648,9 +802,15 @@ func (s *apiServer) recordSysinfo(payload map[string]any) error {
 	if id == "" {
 		return errors.New("missing device id")
 	}
+	if len(id) > maxDeviceIDSize {
+		return errors.New("device id is too long")
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, exists := s.state.Devices[id]; !exists && len(s.state.Devices) >= maxDeviceCount {
+		return errors.New("device inventory is full")
+	}
 
 	device := s.getOrCreateDeviceLocked(id)
 	device.UUID = firstNonEmpty(strings.TrimSpace(stringValue(payload["uuid"])), device.UUID)
@@ -756,11 +916,12 @@ func methodNotAllowed(w http.ResponseWriter, methods ...string) {
 
 func decodeJSON(r *http.Request, dst any) error {
 	defer r.Body.Close()
-	dec := json.NewDecoder(io.LimitReader(r.Body, maxBodySize))
+	dec := json.NewDecoder(io.LimitReader(r.Body, maxBodySize+1))
 	if err := dec.Decode(dst); err != nil {
 		return err
 	}
-	if dec.More() {
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
 		return errors.New("unexpected trailing data")
 	}
 	return nil
@@ -788,7 +949,7 @@ func pageParams(r *http.Request) (int, int) {
 	pageSize := defaultPageSize
 	if value := strings.TrimSpace(r.URL.Query().Get("pageSize")); value != "" {
 		if parsed, err := strconv.Atoi(value); err == nil && parsed > 0 {
-			pageSize = parsed
+			pageSize = min(parsed, maxPageSize)
 		}
 	}
 	return current, pageSize
@@ -797,6 +958,9 @@ func pageParams(r *http.Request) (int, int) {
 func paginate[T any](items []T, current, pageSize int) []T {
 	if pageSize <= 0 {
 		return items
+	}
+	if current <= 0 || current-1 > len(items)/pageSize {
+		return []T{}
 	}
 	start := (current - 1) * pageSize
 	if start >= len(items) {
@@ -877,4 +1041,17 @@ func getenvDuration(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return duration
+}
+
+func getenvBool(key string, fallback bool) bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		log.Printf("invalid boolean %s=%q; using %t", key, value, fallback)
+		return fallback
+	}
+	return parsed
 }
