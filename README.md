@@ -142,6 +142,15 @@ non-root user and stores its state in `/data/state.json`:
 docker pull ghcr.io/invokerw/rustdesk-minimal-api:latest
 ```
 
+If the GHCR package is private, authenticate once before pulling:
+
+```bash
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
+```
+
+Alternatively, change the package visibility to public in the repository's
+GitHub Packages settings.
+
 Create an environment file with mode `600`. Using `--env-file` avoids shell
 expansion of the `$` characters in bcrypt hashes:
 
