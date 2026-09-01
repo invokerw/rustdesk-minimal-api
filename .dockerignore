@@ -1,0 +1,8 @@
+.git
+.github
+state.json
+state.json.tmp
+*.test
+target
+Dockerfile
+README.md

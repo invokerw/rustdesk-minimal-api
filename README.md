@@ -133,6 +133,70 @@ Use Caddy or Nginx to proxy `https://YOUR_HOST` to `127.0.0.1:21114`. Do not exp
 the plain HTTP listener to the Internet: login passwords and Bearer tokens would
 otherwise be sent without transport encryption.
 
+## Docker
+
+The published image is available from GitHub Container Registry. It runs as a
+non-root user and stores its state in `/data/state.json`:
+
+```bash
+docker pull ghcr.io/invokerw/rustdesk-minimal-api:latest
+```
+
+Create an environment file with mode `600`. Using `--env-file` avoids shell
+expansion of the `$` characters in bcrypt hashes:
+
+```bash
+install -m 600 /dev/null rustdesk-api.env
+${EDITOR:-vi} rustdesk-api.env
+```
+
+The file should contain at least:
+
+```text
+RUSTDESK_API_CREDENTIAL=alice:$2y$10$...
+RUSTDESK_API_TOKEN_TTL=720h
+RUSTDESK_API_ENABLE_INVENTORY=false
+```
+
+Start the container with a persistent named volume. Bind the host port to
+loopback when a reverse proxy provides HTTPS:
+
+```bash
+docker volume create rustdesk-api-data
+docker run -d \
+  --name rustdesk-minimal-api \
+  --restart unless-stopped \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+  --env-file ./rustdesk-api.env \
+  -e RUSTDESK_API_LISTEN=0.0.0.0:21114 \
+  -e RUSTDESK_API_DATA=/data/state.json \
+  -p 127.0.0.1:21114:21114 \
+  -v rustdesk-api-data:/data \
+  ghcr.io/invokerw/rustdesk-minimal-api:latest
+```
+
+Check the service and logs:
+
+```bash
+curl http://127.0.0.1:21114/healthz
+docker logs -f rustdesk-minimal-api
+```
+
+For a direct LAN-only deployment, replace the port mapping with
+`-p 21114:21114` and restrict the port at the firewall. Do not publish this
+plain HTTP endpoint to the Internet; put Caddy or Nginx in front of it and use
+the HTTPS URL in RustDesk clients.
+
+To upgrade, pull the new image and recreate the container. The named volume
+keeps the address book and signing secret:
+
+```bash
+docker pull ghcr.io/invokerw/rustdesk-minimal-api:latest
+docker rm -f rustdesk-minimal-api
+# run the same `docker run` command again
+```
+
 ## RustDesk client configuration
 
 ### Compatibility mode
